@@ -220,6 +220,24 @@
         const SUPABASE_ANON_KEY = "sb_publishable_Is1KJw0lCqgCIC4_y2moUw_LfnG1Pqw";
         const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
+        // Pulls EVERY row, 1000 at a time (Supabase returns max 1000 rows per request).
+        // `buildQuery` must return a fresh query each call and end with a unique order
+        // column (id) so pages never skip or duplicate rows.
+        const fetchAllRows = async (buildQuery) => {
+            const pageSize = 1000;
+            let from = 0;
+            let all = [];
+            while (true) {
+                const { data, error } = await buildQuery().range(from, from + pageSize - 1);
+                if (error) throw new Error(error.message);
+                all = all.concat(data || []);
+                if (!data || data.length < pageSize) break;
+                from += pageSize;
+            }
+            return all;
+        };
+
+        
         // Maps a Supabase invoice row (with invoice_items→products and returns
         // joined in) into the exact shape the rest of this app already expects
         // (nested `customer` object, `items` array, `returns` array) — same
@@ -283,7 +301,7 @@
         // `customer:customers!customer_id ( * )` embed pulls the linked customer
         // row (name/email/phone/company/tin) through the customer_id foreign key.
         const fetchInvoicesFromSupabase = async () => {
-            const { data, error } = await sb
+            const data = await fetchAllRows(() => sb
                 .from('invoices')
                 .select(`
                     *,
@@ -291,10 +309,9 @@
                     invoice_items ( *, products ( * ) ),
                     returns ( *, invoice_items ( *, products ( * ) ) )
                 `)
-                .order('invoice_date', { ascending: false });
-
-            if (error) throw new Error(error.message);
-            return (data || []).map(mapSupabaseInvoice);
+                .order('invoice_date', { ascending: false })
+                .order('id', { ascending: false }));
+            return data.map(mapSupabaseInvoice);
         };
 
         // Finds an existing product by SKU (so repeat products don't get
@@ -320,34 +337,19 @@
         // Fetches the full product catalog (for the item autocomplete in the
         // new-transaction form) — independent of which invoices are loaded,
         // so items only used on filtered-out invoices still show up.
-        // Supabase returns at most 1000 rows per request, so we pull the table in
-        // pages until everything is loaded (otherwise products past the first 1000
-        // never show up in the autocomplete / SKU auto-fill).
-        const fetchAllRows = async (table, orderCol) => {
-            const PAGE = 1000;
-            let all = [];
-            for (let from = 0; ; from += PAGE) {
-                const { data, error } = await sb
-                    .from(table)
-                    .select('*')
-                    .order(orderCol, { ascending: true })
-                    .order('id', { ascending: true })
-                    .range(from, from + PAGE - 1);
-                if (error) throw new Error(error.message);
-                all = all.concat(data || []);
-                if (!data || data.length < PAGE) break;
-            }
-            return all;
-        };
-
-        const fetchProductsFromSupabase = async () => fetchAllRows('products', 'name');
+        const fetchProductsFromSupabase = () =>
+            fetchAllRows(() => sb.from('products').select('*')
+                .order('name', { ascending: true })
+                .order('id', { ascending: true }));
 
         // Fetches the full customer catalog (for the customer autocomplete in the
         // new-transaction form + the Customer Profiles tab) — independent of which
         // invoices are loaded, so customers only tied to filtered-out invoices still show up.
         const fetchCustomersFromSupabase = async () => {
-            const data = await fetchAllRows('customers', 'name');
-            return (data || []).map(c => ({
+            const rows = await fetchAllRows(() => sb.from('customers').select('*')
+                .order('name', { ascending: true })
+                .order('id', { ascending: true }));
+            return rows.map(c => ({
                 id: c.id,
                 name: c.name,
                 email: c.email || '',
@@ -901,6 +903,8 @@
 
         const StatCards = ({ invoices, refundInvoices, activeBranch, dateFrom, dateTo }) => {
             const grossRevenue = invoices.reduce((acc, inv) => acc + calculateInvoiceTotals(inv).originalGrandTotal, 0);
+            const totalNetVatSales = invoices.reduce((acc, inv) => acc + calculateInvoiceTotals(inv).netSubtotal, 0);
+            const totalOutputVat = invoices.reduce((acc, inv) => acc + calculateInvoiceTotals(inv).tax, 0);
             const totalReturnedValue = invoices.reduce((acc, inv) => acc + calculateInvoiceTotals(inv).totalReturnedValue, 0);
             const totalCwtWithheld = invoices.reduce((acc, inv) => acc + calculateInvoiceTotals(inv).cwtAmount, 0);
             // Net Cash Receivable for the period: what invoices dated in the period bring in
@@ -931,7 +935,7 @@
                             <i className="fas fa-store"></i> {scopeLabel}{dateLabel}
                         </span>
                     </div>
-                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5 gap-4">
                     <div className="relative overflow-hidden rounded-2xl p-5 shadow-lg group" style={{ background: 'linear-gradient(135deg, #052A33 0%, #0E7C86 55%, #3FBFC4 100%)' }}>
                         <div className="absolute -right-8 -top-10 w-32 h-32 rounded-full bg-white/10 blur-2xl pointer-events-none"></div>
                         <div className="absolute -right-2 -bottom-8 w-24 h-24 rounded-full opacity-70 blur-2xl pointer-events-none" style={{ background: '#FFC857' }}></div>
@@ -943,8 +947,17 @@
                                     <i className="fas fa-receipt"></i> {invoices.length} total sales records
                                 </p>
                             </div>
-                            <div className="w-12 h-12 rounded-xl bg-white/15 border border-white/25 text-white flex items-center justify-center text-xl font-bold backdrop-blur-sm relative">
-                                ₱
+                        </div>
+                    </div>
+
+                    <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-5 relative overflow-hidden group hover:border-slate-300 dark:hover:border-slate-700 transition-all">
+                        <div className="flex items-center justify-between">
+                            <div>
+                                <p className="text-xs font-medium text-slate-500 dark:text-slate-400 uppercase tracking-wider">Net VAT Sales</p>
+                                <h3 className="text-2xl font-bold text-sky-600 dark:text-sky-400 mt-1">{formatCurrency(totalNetVatSales)}</h3>
+                                <p className="text-xs text-slate-500 dark:text-slate-400 mt-2">
+                                    VAT-exclusive • Output VAT {formatCurrency(totalOutputVat)}
+                                </p>
                             </div>
                         </div>
                     </div>
@@ -958,9 +971,6 @@
                                     <i className="fas fa-rotate-left"></i> Reference only — not deducted from gross sales
                                 </p>
                             </div>
-                            <div className="w-12 h-12 rounded-xl bg-rose-500/10 border border-rose-500/20 text-rose-600 dark:text-rose-400 flex items-center justify-center text-xl">
-                                <i className="fas fa-arrow-rotate-left"></i>
-                            </div>
                         </div>
                     </div>
 
@@ -973,9 +983,6 @@
                                     Creditable Tax (1%/2% CWT)
                                 </p>
                             </div>
-                            <div className="w-12 h-12 rounded-xl bg-amber-500/10 border border-amber-500/20 text-amber-600 dark:text-amber-400 flex items-center justify-center text-xl">
-                                <i className="fas fa-file-signature"></i>
-                            </div>
                         </div>
                     </div>
 
@@ -987,9 +994,6 @@
                                 <p className="text-xs text-slate-500 dark:text-slate-400 mt-2">
                                     Net of 2307 withholding, credit notes applied{refundsPaid > 0 ? ` & ${formatCurrency(refundsPaid)} cash refunds` : ' & cash refunds'}
                                 </p>
-                            </div>
-                            <div className="w-12 h-12 rounded-xl bg-emerald-500/10 border border-emerald-500/20 text-emerald-600 dark:text-emerald-400 flex items-center justify-center text-xl">
-                                <i className="fas fa-hand-holding-dollar"></i>
                             </div>
                         </div>
                     </div>
@@ -1146,6 +1150,7 @@
                 filters.paymentMethod !== 'ALL',
                 filters.returnFilter && filters.returnFilter !== 'ALL',
                 filters.cwtFilter !== 'ALL',
+                filters.vatFilter && filters.vatFilter !== 'ALL',
                 !!(filters.dateFrom || filters.dateTo)
             ].filter(Boolean).length;
 
@@ -1228,7 +1233,7 @@
                     </div>
 
                     {/* Row 2: dropdown filters */}
-                    <div className="px-4 pb-4 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3">
+                    <div className="px-4 pb-4 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6 gap-3">
                         <FilterSelect label="Branch" icon="fa-store" active={filters.branch !== 'ALL'} value={filters.branch} onChange={(v) => setFilters({ ...filters, branch: v })}>
                             <option value="ALL">All branches</option>
                             {branches.map(b => <option key={b} value={b}>{b}</option>)}
@@ -1256,10 +1261,28 @@
                             <option value="WITH_2307">With 2307 (CWT &gt; 0%)</option>
                             <option value="NO_2307">No 2307 (0%)</option>
                         </FilterSelect>
+
+                        <FilterSelect label="VAT" icon="fa-percent" active={!!filters.vatFilter && filters.vatFilter !== 'ALL'} value={filters.vatFilter || 'ALL'} onChange={(v) => setFilters({ ...filters, vatFilter: v })}>
+                            <option value="ALL">All VAT types</option>
+                            <option value="WITH_VAT">With VAT (VAT &gt; 0%)</option>
+                            <option value="NO_VAT">Without VAT (0%)</option>
+                        </FilterSelect>
                     </div>
 
                     {/* Row 3: dates */}
                     <div className="px-4 py-3.5 border-t border-slate-200/70 dark:border-slate-800/60 bg-slate-50/60 dark:bg-slate-950/30 rounded-b-2xl flex flex-wrap items-end gap-x-6 gap-y-3">
+                        {/* Specific date (one day only) */}
+                        <div>
+                            <div className="text-[10px] font-semibold text-slate-500 dark:text-slate-400 uppercase tracking-wider mb-1">Specific date</div>
+                            <input
+                                type="date"
+                                aria-label="Specific date"
+                                value={isSingleDay ? filters.dateFrom : ''}
+                                onChange={(e) => setFilters({ ...filters, dateFrom: e.target.value, dateTo: e.target.value })}
+                                className={`${dateInputCls} w-[9.25rem] ${isSingleDay ? 'border-indigo-400' : 'border-slate-200 dark:border-slate-800'}`}
+                            />
+                        </div>
+
                         {/* Date range */}
                         <div>
                             <div className="text-[10px] font-semibold text-slate-500 dark:text-slate-400 uppercase tracking-wider mb-1">Date range</div>
@@ -1841,7 +1864,7 @@
             );
         };
 
-        const InvoiceModal = ({ invoice, onClose, onOpenReturnModal, creditNotes = [], onApplyCreditNote, salesReps = [], onUpdateSalesRep, isAdmin = false, onUpdateCwt2307 }) => {
+        const InvoiceModal = ({ invoice, onClose, onOpenReturnModal, creditNotes = [], onApplyCreditNote, salesReps = [], onUpdateSalesRep, isAdmin = false, onUpdateCwt2307, onEditInvoice }) => {
             if (!invoice) return null;
             const totals = calculateInvoiceTotals(invoice);
             const [selectedApplyCnId, setSelectedApplyCnId] = React.useState('');
@@ -1892,6 +1915,7 @@
             };
 
             const handlePrint = () => {
+                logAppEvent('PRINT_INVOICE', invoice.id, 'Printed invoice');
                 window.print();
             };
 
@@ -1914,6 +1938,14 @@
                                 )}
                             </div>
                             <div className="flex items-center gap-2">
+                                {isAdmin && onEditInvoice && (
+                                    <button
+                                        onClick={() => onEditInvoice(invoice.id)}
+                                        className="bg-amber-500/20 hover:bg-amber-500/35 text-amber-700 dark:text-amber-300 border border-amber-500/40 text-xs px-3 py-1.5 rounded-lg flex items-center gap-1.5 font-medium transition-colors"
+                                    >
+                                        <i className="fas fa-pen-to-square"></i> Edit Invoice
+                                    </button>
+                                )}
                                 <button
                                     onClick={() => onOpenReturnModal(invoice)}
                                     className="bg-rose-600/30 hover:bg-rose-600/50 text-rose-700 dark:text-rose-300 border border-rose-500/40 text-xs px-3 py-1.5 rounded-lg flex items-center gap-1.5 font-medium transition-colors"
@@ -2106,13 +2138,20 @@
                                             <span className="text-slate-800 dark:text-slate-200">{formatCurrency(totals.originalSubtotal)}</span>
                                         </div>
 
+                                        {totals.totalDiscount > 0 && (
+                                            <div className="flex justify-between text-slate-500 dark:text-slate-400">
+                                                <span>Less: Discount:</span>
+                                                <span className="text-rose-600 dark:text-rose-400">-{formatCurrency(totals.totalDiscount)}</span>
+                                            </div>
+                                        )}
+
                                         <div className="flex justify-between text-slate-500 dark:text-slate-400">
-                                            <span>Net Taxable Subtotal:</span>
+                                            <span>{invoice.taxRate > 0 ? 'Net Taxable Subtotal:' : 'Net Sales (Non-VAT):'}</span>
                                             <span className="text-slate-800 dark:text-slate-200">{formatCurrency(totals.netSubtotal)}</span>
                                         </div>
 
                                         <div className="flex justify-between text-slate-500 dark:text-slate-400">
-                                            <span>12% Output VAT:</span>
+                                            <span>{invoice.taxRate > 0 ? `${invoice.taxRate}% Output VAT:` : 'VAT (0% / Non-VAT):'}</span>
                                             <span className="text-slate-800 dark:text-slate-200">{formatCurrency(totals.tax)}</span>
                                         </div>
 
@@ -2214,132 +2253,6 @@
             );
         };
 
-        // Text input with a wide custom dropdown (the browser's native <datalist> popup is only
-        // as wide as the input, which cuts off long SKUs / product names). Shows SKU, full name
-        // and SRP for every match; typing still works as free text.
-        const ProductPicker = ({ value, placeholder, products, onType, onPick, inputClassName }) => {
-            const [open, setOpen] = React.useState(false);
-            const [active, setActive] = React.useState(0);
-            const [rect, setRect] = React.useState(null);
-            const inputRef = React.useRef(null);
-            const listRef = React.useRef(null);
-            const term = String(value || '').trim().toLowerCase();
-
-            const matches = React.useMemo(() => {
-                if (term.length < 2) return [];
-                return products.filter(p =>
-                    (p.sku || '').toLowerCase().includes(term) || (p.name || '').toLowerCase().includes(term)
-                ).slice(0, 30);
-            }, [term, products]);
-
-            const showList = open && matches.length > 0;
-
-            React.useEffect(() => { setActive(0); }, [term]);
-
-            // The list is drawn in a portal on <body> (position: fixed) so the scrolling form /
-            // modal can never clip it or sit on top of it, and clicks always reach it.
-            const updateRect = React.useCallback(() => {
-                if (inputRef.current) setRect(inputRef.current.getBoundingClientRect());
-            }, []);
-
-            React.useEffect(() => {
-                if (!showList) return;
-                updateRect();
-                window.addEventListener('resize', updateRect);
-                window.addEventListener('scroll', updateRect, true);
-                return () => {
-                    window.removeEventListener('resize', updateRect);
-                    window.removeEventListener('scroll', updateRect, true);
-                };
-            }, [showList, matches.length, updateRect]);
-
-            React.useEffect(() => {
-                if (!showList || !listRef.current) return;
-                const el = listRef.current.querySelector(`[data-idx="${active}"]`);
-                if (el && el.scrollIntoView) el.scrollIntoView({ block: 'nearest' });
-            }, [active, showList]);
-
-            const choose = (p) => { onPick(p); setOpen(false); };
-
-            const handleKeyDown = (e) => {
-                if (e.key === 'ArrowDown') {
-                    if (!matches.length) return;
-                    e.preventDefault();
-                    if (!open) { setOpen(true); return; }
-                    setActive(i => Math.min(i + 1, matches.length - 1));
-                } else if (e.key === 'ArrowUp') {
-                    if (!showList) return;
-                    e.preventDefault();
-                    setActive(i => Math.max(i - 1, 0));
-                } else if (e.key === 'Enter') {
-                    if (showList) { e.preventDefault(); choose(matches[active] || matches[0]); }
-                } else if (e.key === 'Escape') {
-                    if (showList) { e.preventDefault(); e.stopPropagation(); setOpen(false); }
-                } else if (e.key === 'Tab') {
-                    setOpen(false);
-                }
-            };
-
-            let listStyle = null;
-            if (showList && rect) {
-                const width = Math.max(rect.width, Math.min(448, window.innerWidth - rect.left - 12));
-                const spaceBelow = window.innerHeight - rect.bottom;
-                const openUp = spaceBelow < 220 && rect.top > spaceBelow;
-                listStyle = {
-                    position: 'fixed',
-                    left: Math.max(8, Math.min(rect.left, window.innerWidth - width - 8)),
-                    width,
-                    maxHeight: Math.max(120, Math.min(288, (openUp ? rect.top : spaceBelow) - 16)),
-                    zIndex: 1000,
-                    ...(openUp ? { bottom: window.innerHeight - rect.top + 4 } : { top: rect.bottom + 4 })
-                };
-            }
-
-            return (
-                <div className="relative">
-                    <input
-                        ref={inputRef}
-                        type="text"
-                        autoComplete="off"
-                        placeholder={placeholder}
-                        value={value}
-                        onChange={(e) => { onType(e.target.value); setOpen(true); }}
-                        onFocus={() => setOpen(true)}
-                        onBlur={() => setOpen(false)}
-                        onKeyDown={handleKeyDown}
-                        className={inputClassName}
-                    />
-                    {showList && listStyle && ReactDOM.createPortal(
-                        <div
-                            ref={listRef}
-                            style={listStyle}
-                            onMouseDown={(e) => e.preventDefault()}
-                            className="overflow-y-auto rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 shadow-2xl divide-y divide-slate-100 dark:divide-slate-800"
-                        >
-                            {matches.map((p, i) => (
-                                <div
-                                    key={p.id}
-                                    data-idx={i}
-                                    role="option"
-                                    aria-selected={i === active}
-                                    onMouseEnter={() => setActive(i)}
-                                    onClick={() => choose(p)}
-                                    className={`w-full text-left px-3 py-2 cursor-pointer ${i === active ? 'bg-indigo-100 dark:bg-slate-700' : 'hover:bg-indigo-50 dark:hover:bg-slate-800'}`}
-                                >
-                                    <div className="text-xs font-semibold text-slate-900 dark:text-white break-words">{p.name}</div>
-                                    <div className="text-[11px] text-slate-500 dark:text-slate-400 font-mono break-all">
-                                        {p.sku || p.id}{p.srp !== null && p.srp !== undefined ? ` • SRP ₱${Number(p.srp).toLocaleString()}` : ''}
-                                    </div>
-                                </div>
-                            ))}
-                            <div className="px-3 py-1.5 text-[10px] text-slate-400 bg-slate-50 dark:bg-slate-950 sticky bottom-0">↑ ↓ para pumili • Enter para piliin • Esc para isara</div>
-                        </div>,
-                        document.body
-                    )}
-                </div>
-            );
-        };
-
         const NewTransactionModal = ({ isOpen, onClose, onSave, branches, products = [], customers = [], creditNotes = [], salesReps = [] }) => {
             if (!isOpen) return null;
 
@@ -2365,7 +2278,6 @@
             ]);
             const [selectedCreditNoteId, setSelectedCreditNoteId] = React.useState('');
             const [creditAmountToApply, setCreditAmountToApply] = React.useState(0);
-            const [pendingSave, setPendingSave] = React.useState(null); // { newInvoice, appliedCreditNote } waiting for the person to confirm
 
             // This is where a credit note actually gets redeemed: only when the customer
             // buys again and a new invoice is being logged, never against the invoice it
@@ -2419,16 +2331,6 @@
                 }
             };
 
-            // Picking a row from the dropdown fills SKU, name, category and price at once.
-            const handlePickProduct = (index, p) => {
-                setItems(prev => prev.map((it, i) => {
-                    if (i !== index) return it;
-                    const price = (p.lastPrice !== null && p.lastPrice !== undefined) ? p.lastPrice
-                        : (p.srp !== null && p.srp !== undefined) ? p.srp : it.unitPrice;
-                    return { ...it, sku: p.sku || '', name: p.name || '', category: p.category || 'General', unitPrice: price };
-                }));
-            };
-
             const handleItemChange = (index, field, value) => {
                 const newItems = [...items];
                 newItems[index][field] = value;
@@ -2436,48 +2338,27 @@
                 // When the product name matches an entry in the catalog (picked
                 // from the datalist), auto-fill SKU/category/price so the person
                 // only has to set qty and discount.
-                // Price to pre-fill: last sold price, otherwise the catalog SRP.
-                const priceFor = (m) => {
-                    if (m.lastPrice !== null && m.lastPrice !== undefined) return m.lastPrice;
-                    if (m.srp !== null && m.srp !== undefined) return m.srp;
-                    return null;
-                };
-
                 if (field === 'name') {
-                    const key = String(value).trim().toLowerCase();
-                    const match = key && products.find(p => (p.name || '').trim().toLowerCase() === key);
+                    const match = products.find(p => p.name.toLowerCase() === String(value).toLowerCase());
                     if (match) {
                         newItems[index].sku = match.sku || '';
                         newItems[index].category = match.category || 'General';
-                        const price = priceFor(match);
-                        if (price !== null) newItems[index].unitPrice = price;
+                        if (match.lastPrice !== null && match.lastPrice !== undefined) {
+                            newItems[index].unitPrice = match.lastPrice;
+                        }
                     }
                 }
 
                 // Same auto-fill, but keyed off SKU instead — staff here usually
                 // search/remember products by SKU rather than full product name.
                 if (field === 'sku') {
-                    const key = String(value).trim().toLowerCase();
-                    const match = key && products.find(p => p.sku && p.sku.trim().toLowerCase() === key);
+                    const match = products.find(p => p.sku && p.sku.toLowerCase() === String(value).toLowerCase());
                     if (match) {
                         newItems[index].name = match.name || '';
                         newItems[index].category = match.category || 'General';
-                        const price = priceFor(match);
-                        if (price !== null) newItems[index].unitPrice = price;
-                    } else if (key.length >= 3) {
-                        // Not in the locally loaded list: ask the database directly by exact SKU
-                        // so a product is never missed just because the list is incomplete.
-                        const typedSku = String(value).trim();
-                        sb.from('products').select('*').ilike('sku', typedSku.replace(/[\\%_]/g, '\\$&')).limit(1)
-                            .then(({ data }) => {
-                                const m = data && data[0];
-                                if (!m) return;
-                                setItems(prev => prev.map((it, i) => {
-                                    if (i !== index || String(it.sku).trim().toLowerCase() !== key) return it;
-                                    const price = (m.srp !== null && m.srp !== undefined) ? m.srp : it.unitPrice;
-                                    return { ...it, name: m.name || it.name, category: m.category || it.category, unitPrice: price };
-                                }));
-                            });
+                        if (match.lastPrice !== null && match.lastPrice !== undefined) {
+                            newItems[index].unitPrice = match.lastPrice;
+                        }
                     }
                 }
 
@@ -2554,68 +2435,12 @@
                     }
                 }
 
-                // Don't save yet — ask first, so an accidental Enter key never saves an invoice.
-                setPendingSave({ newInvoice, appliedCreditNote });
-            };
-
-            const confirmSave = () => {
-                if (!pendingSave) return;
-                const { newInvoice, appliedCreditNote } = pendingSave;
-                setPendingSave(null);
                 onSave(newInvoice, appliedCreditNote);
                 onClose();
             };
 
             return (
                 <div className="fixed inset-0 z-50 flex items-start justify-center bg-slate-900/50 dark:bg-slate-950/80 backdrop-blur-md p-4 overflow-y-auto">
-                    {pendingSave && (() => {
-                        const inv = pendingSave.newInvoice;
-                        const gross = inv.items.reduce((sum, it) => sum + (it.qty * it.unitPrice * (1 - ((it.discountPercent || 0) / 100))), 0);
-                        const credit = pendingSave.appliedCreditNote ? pendingSave.appliedCreditNote.amount : 0;
-                        return (
-                            <div
-                                className="fixed inset-0 flex items-center justify-center bg-slate-900/60 p-4"
-                                style={{ zIndex: 80 }}
-                                onKeyDown={(e) => { if (e.key === 'Escape') setPendingSave(null); }}
-                            >
-                                <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-2xl shadow-2xl w-full max-w-md p-6 text-sm">
-                                    <h3 className="text-base font-bold text-slate-900 dark:text-white flex items-center gap-2">
-                                        <i className="fas fa-circle-question text-indigo-500"></i> Save this invoice?
-                                    </h3>
-                                    <p className="text-slate-500 dark:text-slate-400 mt-1 text-xs">Please double-check the details before saving.</p>
-                                    <div className="mt-4 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950 p-3 space-y-1.5 text-xs">
-                                        <div className="flex justify-between gap-3"><span className="text-slate-500">Invoice #</span><strong className="text-slate-900 dark:text-white font-mono">{inv.id}</strong></div>
-                                        <div className="flex justify-between gap-3"><span className="text-slate-500">Date</span><strong className="text-slate-900 dark:text-white">{inv.date}</strong></div>
-                                        <div className="flex justify-between gap-3"><span className="text-slate-500">Branch</span><strong className="text-slate-900 dark:text-white">{inv.branch}</strong></div>
-                                        <div className="flex justify-between gap-3"><span className="text-slate-500">Customer</span><strong className="text-slate-900 dark:text-white text-right">{inv.customer.name}</strong></div>
-                                        <div className="flex justify-between gap-3"><span className="text-slate-500">Payment</span><strong className="text-slate-900 dark:text-white">{inv.paymentMethod}</strong></div>
-                                        <div className="flex justify-between gap-3"><span className="text-slate-500">Items</span><strong className="text-slate-900 dark:text-white">{inv.items.length} line(s), {inv.items.reduce((s, it) => s + it.qty, 0)} unit(s)</strong></div>
-                                        <div className="flex justify-between gap-3 pt-1.5 border-t border-slate-200 dark:border-slate-800"><span className="text-slate-500">Invoice total</span><strong className="text-slate-900 dark:text-white">{formatCurrency(gross)}</strong></div>
-                                        {credit > 0 && (
-                                            <div className="flex justify-between gap-3"><span className="text-slate-500">Credit note applied</span><strong className="text-rose-600 dark:text-rose-400">-{formatCurrency(credit)}</strong></div>
-                                        )}
-                                    </div>
-                                    <div className="flex justify-end gap-2 mt-5">
-                                        <button
-                                            type="button"
-                                            autoFocus
-                                            onClick={() => setPendingSave(null)}
-                                            className="px-4 py-2 rounded-xl bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 font-medium"
-                                        >
-                                            No, go back
-                                        </button>
-                                        <button
-                                            type="button"
-                                            onClick={confirmSave}
-                                            className="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-semibold shadow-lg shadow-indigo-600/30"
-                                        >
-                                            Yes, save invoice
-                                        </button>
-                                    </div>
-                                </div>
-                            </div>
-                        );
-                    })()}
                     <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 w-full max-w-5xl rounded-2xl shadow-2xl overflow-hidden my-8">
                         <div className="bg-slate-100 dark:bg-slate-800/90 px-6 py-4 border-b border-slate-300 dark:border-slate-700 flex justify-between items-center">
                             <h3 className="text-base font-bold text-slate-900 dark:text-white flex items-center gap-2">
@@ -2859,27 +2684,39 @@
                                     </button>
                                 </div>
 
+                                <datalist id="product-name-options">
+                                    {products.map(p => (
+                                        <option key={p.id} value={p.name} />
+                                    ))}
+                                </datalist>
+
+                                <datalist id="product-sku-options">
+                                    {products.filter(p => p.sku).map(p => (
+                                        <option key={p.id} value={p.sku} label={p.name} />
+                                    ))}
+                                </datalist>
+
                                 <div className="space-y-3">
                                     {items.map((item, idx) => (
                                         <div key={idx} className="bg-slate-50 dark:bg-slate-950 p-3 rounded-xl border border-slate-200 dark:border-slate-800 grid grid-cols-1 sm:grid-cols-12 gap-2 items-center">
                                             <div className="sm:col-span-4">
-                                                <ProductPicker
+                                                <input
+                                                    type="text"
+                                                    list="product-sku-options"
                                                     placeholder="SKU"
                                                     value={item.sku}
-                                                    products={products}
-                                                    onType={(v) => handleItemChange(idx, 'sku', v)}
-                                                    onPick={(p) => handlePickProduct(idx, p)}
-                                                    inputClassName="w-full bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg px-2 py-1.5 text-slate-900 dark:text-white focus:border-indigo-500"
+                                                    onChange={(e) => handleItemChange(idx, 'sku', e.target.value)}
+                                                    className="w-full bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg px-2 py-1.5 text-slate-900 dark:text-white focus:border-indigo-500"
                                                 />
                                             </div>
                                             <div className="sm:col-span-4">
-                                                <ProductPicker
+                                                <input
+                                                    type="text"
+                                                    list="product-name-options"
                                                     placeholder="Product Name *"
                                                     value={item.name}
-                                                    products={products}
-                                                    onType={(v) => handleItemChange(idx, 'name', v)}
-                                                    onPick={(p) => handlePickProduct(idx, p)}
-                                                    inputClassName="w-full bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg px-2.5 py-1.5 text-slate-900 dark:text-white focus:border-indigo-500"
+                                                    onChange={(e) => handleItemChange(idx, 'name', e.target.value)}
+                                                    className="w-full bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg px-2.5 py-1.5 text-slate-900 dark:text-white focus:border-indigo-500"
                                                 />
                                             </div>
                                             <div className="sm:col-span-1">
@@ -3087,9 +2924,9 @@
 
             const getPaymentBadgeColor = (rawMethod) => {
                 const method = String(rawMethod ?? '');
-                if (method === 'A/R') return 'bg-amber-500/10 text-amber-700 dark:text-amber-400 border-amber-500/20';
-                if (method === 'Card') return 'bg-blue-500/10 text-blue-600 dark:text-blue-400 border-blue-500/20';
-                if (method.includes('Check')) return 'bg-indigo-500/10 text-indigo-600 dark:text-indigo-400 border-indigo-500/20';
+                if (method.includes('GCash')) return 'bg-blue-500/10 text-blue-600 dark:text-blue-400 border-blue-500/20';
+                if (method.includes('Maya')) return 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border-emerald-500/20';
+                if (method.includes('Bank')) return 'bg-indigo-500/10 text-indigo-600 dark:text-indigo-400 border-indigo-500/20';
                 if (method.includes('Cash')) return 'bg-teal-500/10 text-teal-600 dark:text-teal-400 border-teal-500/20';
                 return 'bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300 border-slate-300 dark:border-slate-700';
             };
@@ -4246,6 +4083,43 @@
             const [loading, setLoading] = React.useState(true);
             const [busyId, setBusyId] = React.useState(null);
             const [confirm, setConfirm] = React.useState(null); // { row, role }
+            const [pwdFor, setPwdFor] = React.useState(null); // profile row whose password is being set
+            const [pwd, setPwd] = React.useState('');
+            const [showPwd, setShowPwd] = React.useState(true);
+            const [pwdBusy, setPwdBusy] = React.useState(false);
+
+            const generatePwd = () => {
+                const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789';
+                const arr = new Uint32Array(12);
+                crypto.getRandomValues(arr);
+                setPwd(Array.from(arr, n => chars[n % chars.length]).join(''));
+                setShowPwd(true);
+            };
+
+            const closePwd = () => { if (!pwdBusy) { setPwdFor(null); setPwd(''); } };
+
+            const savePwd = async () => {
+                if (pwd.length < 8) { notify('Password must be at least 8 characters.', 'error'); return; }
+                setPwdBusy(true);
+                try {
+                    const { data, error } = await sb.functions.invoke('admin-set-password', {
+                        body: { userId: pwdFor.id, password: pwd }
+                    });
+                    if (error) {
+                        let msg = error.message;
+                        try { const j = await error.context.json(); if (j && j.error) msg = j.error; } catch (_) {}
+                        throw new Error(msg);
+                    }
+                    if (data && data.error) throw new Error(data.error);
+                    notify(`Password updated for ${pwdFor.email}.`);
+                    setPwdFor(null);
+                    setPwd('');
+                } catch (err) {
+                    notify(err.message, 'error');
+                } finally {
+                    setPwdBusy(false);
+                }
+            };
 
             const load = React.useCallback(async () => {
                 const { data, error } = await sb.from('profiles').select('*').order('created_at', { ascending: true });
@@ -4300,7 +4174,13 @@
                                                     </span>
                                                 </td>
                                                 <td className={adminTd}>{row.created_at ? new Date(row.created_at).toLocaleDateString() : ''}</td>
-                                                <td className={`${adminTd} text-right`}>
+                                                <td className={`${adminTd} text-right whitespace-nowrap`}>
+                                                    <button
+                                                        className={`${adminBtnGhost} mr-2`}
+                                                        onClick={() => { setPwdFor(row); setPwd(''); setShowPwd(true); }}
+                                                    >
+                                                        <i className="fas fa-key mr-1"></i> Set password
+                                                    </button>
                                                     <button
                                                         className={isAdmin ? adminBtnGhost : adminBtnPrimary}
                                                         disabled={isSelf || busyId === row.id}
@@ -4316,6 +4196,42 @@
                                 </tbody>
                             </table>
                         </div>
+                    )}
+                    {pwdFor && (
+                        <AdminModal
+                            title="Set password"
+                            onClose={closePwd}
+                            footer={
+                                <React.Fragment>
+                                    <span></span>
+                                    <div className="flex gap-2">
+                                        <button className={adminBtnGhost} onClick={closePwd} disabled={pwdBusy}>Cancel</button>
+                                        <button className={adminBtnPrimary} onClick={savePwd} disabled={pwdBusy || pwd.length < 8}>{pwdBusy ? 'Saving...' : 'Set password'}</button>
+                                    </div>
+                                </React.Fragment>
+                            }
+                        >
+                            <div className="space-y-3">
+                                <p className="text-sm text-slate-600 dark:text-slate-300">
+                                    Set a new password for <b>{pwdFor.email}</b>. Their current password stops working immediately. Passwords can't be viewed, only replaced.
+                                </p>
+                                <AdminField label="New password" hint="At least 8 characters. Share it with them privately.">
+                                    <div className="flex gap-2">
+                                        <input
+                                            className={adminInput}
+                                            type={showPwd ? 'text' : 'password'}
+                                            autoComplete="new-password"
+                                            value={pwd}
+                                            onChange={(e) => setPwd(e.target.value)}
+                                        />
+                                        <button type="button" className={adminBtnGhost} onClick={() => setShowPwd(v => !v)} title={showPwd ? 'Hide' : 'Show'}>
+                                            <i className={`fas ${showPwd ? 'fa-eye-slash' : 'fa-eye'}`}></i>
+                                        </button>
+                                        <button type="button" className={adminBtnGhost} onClick={generatePwd}>Generate</button>
+                                    </div>
+                                </AdminField>
+                            </div>
+                        </AdminModal>
                     )}
                     {confirm && (
                         <AdminConfirm
@@ -4496,7 +4412,7 @@
             );
         };
 
-        const InvoiceEditor = ({ invoiceId, customers, notify, onClose, onChanged }) => {
+        const InvoiceEditor = ({ invoiceId, customers, notify, onClose, onChanged, onRenamed }) => {
             const [loading, setLoading] = React.useState(true);
             const [inv, setInv] = React.useState(null);
             const [f, setF] = React.useState({});
@@ -4520,6 +4436,7 @@
                 setInv(data);
                 if (resetForm) {
                     setF({
+                        id: data.id,
                         branch: data.branch || '',
                         invoice_date: data.invoice_date || '',
                         payment_method: data.payment_method || '',
@@ -4558,9 +4475,13 @@
 
             const saveInvoice = async () => {
                 if (!f.invoice_date) { notify('Invoice date is required.', 'error'); return; }
+                const newId = (f.id || '').trim();
+                if (!newId) { notify('Invoice number is required.', 'error'); return; }
+                const renamed = newId !== invoiceId;
                 setSaving(true);
                 try {
                     await adminUpdate('invoices', { id: invoiceId }, {
+                        ...(renamed ? { id: newId } : {}),
                         branch: f.branch || null,
                         invoice_date: f.invoice_date,
                         payment_method: f.payment_method || null,
@@ -4572,11 +4493,12 @@
                         sales_rep: f.sales_rep || null,
                         customer_id: f.customer_id || null
                     });
-                    notify(`Invoice ${invoiceId} saved.`);
+                    notify(renamed ? `Invoice renamed to ${newId} and saved.` : `Invoice ${invoiceId} saved.`);
                     onChanged();
-                    await load(true);
+                    if (renamed) { onRenamed(newId); } else { await load(true); }
                 } catch (err) {
-                    notify(err.message, 'error');
+                    const dup = /duplicate key|already exists/i.test(err.message || '');
+                    notify(dup ? `Invoice number ${newId} already exists. Choose a different number.` : err.message, 'error');
                 } finally {
                     setSaving(false);
                 }
@@ -4659,6 +4581,11 @@
                         ) : (
                             <div className="space-y-6">
                                 <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+                                    <div className="sm:col-span-2 lg:col-span-3">
+                                        <AdminField label="Invoice number" hint="Changing this also updates the invoice's line items and returns. Copies already printed or sent keep the old number.">
+                                            <input className={`${adminInput} sm:max-w-sm font-semibold`} value={f.id || ''} onChange={set('id')} />
+                                        </AdminField>
+                                    </div>
                                     <AdminField label="Invoice date">
                                         <input type="date" className={adminInput} value={f.invoice_date} onChange={set('invoice_date')} />
                                     </AdminField>
@@ -4887,6 +4814,7 @@
                             customers={customers}
                             notify={notify}
                             onClose={() => setEditingId(null)}
+                            onRenamed={(newId) => setEditingId(newId)}
                             onChanged={() => { setReloadKey(k => k + 1); onChanged(); }}
                         />
                     )}
@@ -5266,17 +5194,238 @@
         };
 
         // ---------------------------------------------------------------
+        // Activity Log (read-only audit trail, written by database triggers)
+        // ---------------------------------------------------------------
+        const ACTIVITY_TABLE_LABELS = {
+            invoices: 'Invoice', invoice_items: 'Invoice item', returns: 'Return', customers: 'Customer',
+            products: 'Product', profiles: 'User / role', branches: 'Branch', app: 'App', auth: 'Password'
+        };
+        const ACTIVITY_ACTION_LABELS = {
+            INSERT: 'Created', UPDATE: 'Updated', DELETE: 'Deleted', LOGIN: 'Signed in',
+            EXPORT_CSV: 'Exported CSV', PRINT_INVOICE: 'Printed invoice', SET_PASSWORD: 'Set password'
+        };
+        const ACTIVITY_ACTION_STYLE = {
+            INSERT: 'bg-emerald-100 text-emerald-700 dark:bg-emerald-500/20 dark:text-emerald-300',
+            UPDATE: 'bg-amber-100 text-amber-700 dark:bg-amber-500/20 dark:text-amber-300',
+            DELETE: 'bg-rose-100 text-rose-700 dark:bg-rose-500/20 dark:text-rose-300',
+            LOGIN: 'bg-sky-100 text-sky-700 dark:bg-sky-500/20 dark:text-sky-300',
+            EXPORT_CSV: 'bg-indigo-100 text-indigo-700 dark:bg-indigo-500/20 dark:text-indigo-300',
+            PRINT_INVOICE: 'bg-indigo-100 text-indigo-700 dark:bg-indigo-500/20 dark:text-indigo-300',
+            SET_PASSWORD: 'bg-violet-100 text-violet-700 dark:bg-violet-500/20 dark:text-violet-300'
+        };
+        const activityValue = (v) => {
+            if (v === null || v === undefined || v === '') return '—';
+            if (typeof v === 'object') return JSON.stringify(v);
+            return String(v);
+        };
+        const activityWhat = (r) => {
+            const label = ACTIVITY_TABLE_LABELS[r.table_name] || r.table_name || '';
+            if (r.table_name === 'app') return r.record_id ? `${label} • ${r.record_id}` : label;
+            if (r.parent_id) return `${label} in ${r.parent_id}`;
+            return r.record_id ? `${label} ${r.record_id}` : label;
+        };
+
+        const ActivityDetail = ({ row, onClose }) => {
+            const oldD = row.old_data || {};
+            const newD = row.new_data || {};
+            const keys = row.action === 'UPDATE'
+                ? Object.keys(newD)
+                : Object.keys(row.action === 'DELETE' ? oldD : newD);
+            return (
+                <AdminModal title={`${ACTIVITY_ACTION_LABELS[row.action] || row.action} — ${activityWhat(row)}`} onClose={onClose} wide>
+                    <div className="text-xs text-slate-500 dark:text-slate-400 mb-3">
+                        {new Date(row.created_at).toLocaleString()} • {row.actor_email || 'Unknown'}{row.actor_role ? ` (${row.actor_role === 'admin' ? 'Admin' : 'Staff'})` : ''}
+                    </div>
+                    {row.summary && row.action !== 'UPDATE' && row.action !== 'INSERT' && row.action !== 'DELETE' && (
+                        <p className="text-sm text-slate-700 dark:text-slate-200 mb-3">{row.summary}</p>
+                    )}
+                    {keys.length > 0 ? (
+                        <div className="overflow-x-auto border border-slate-200 dark:border-slate-800 rounded-lg">
+                            <table className="w-full">
+                                <thead className="bg-slate-50 dark:bg-slate-800/50">
+                                    <tr>
+                                        <th className={adminTh}>Field</th>
+                                        {row.action === 'UPDATE' ? (<React.Fragment><th className={adminTh}>Before</th><th className={adminTh}>After</th></React.Fragment>) : <th className={adminTh}>Value</th>}
+                                    </tr>
+                                </thead>
+                                <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
+                                    {keys.map(k => (
+                                        <tr key={k}>
+                                            <td className={`${adminTd} font-medium whitespace-nowrap`}>{k}</td>
+                                            {row.action === 'UPDATE' ? (
+                                                <React.Fragment>
+                                                    <td className={`${adminTd} text-rose-600 dark:text-rose-400 break-all`}>{activityValue(oldD[k])}</td>
+                                                    <td className={`${adminTd} text-emerald-600 dark:text-emerald-400 break-all`}>{activityValue(newD[k])}</td>
+                                                </React.Fragment>
+                                            ) : (
+                                                <td className={`${adminTd} break-all`}>{activityValue((row.action === 'DELETE' ? oldD : newD)[k])}</td>
+                                            )}
+                                        </tr>
+                                    ))}
+                                </tbody>
+                            </table>
+                        </div>
+                    ) : (
+                        <p className="text-sm text-slate-400">No extra details were recorded for this entry.</p>
+                    )}
+                </AdminModal>
+            );
+        };
+
+        const ActivityLogAdmin = ({ notify }) => {
+            const [qInput, setQInput] = React.useState('');
+            const q = useAdminDebounced(qInput);
+            const [tableFilter, setTableFilter] = React.useState('');
+            const [actionFilter, setActionFilter] = React.useState('');
+            const [actorFilter, setActorFilter] = React.useState('');
+            const [dateFrom, setDateFrom] = React.useState('');
+            const [dateTo, setDateTo] = React.useState('');
+            const [page, setPage] = React.useState(0);
+            const [rows, setRows] = React.useState([]);
+            const [total, setTotal] = React.useState(0);
+            const [loading, setLoading] = React.useState(true);
+            const [actors, setActors] = React.useState([]);
+            const [detail, setDetail] = React.useState(null);
+            const [reloadKey, setReloadKey] = React.useState(0);
+
+            React.useEffect(() => { setPage(0); }, [q, tableFilter, actionFilter, actorFilter, dateFrom, dateTo]);
+
+            React.useEffect(() => {
+                sb.from('profiles').select('email').order('email').then(({ data }) => {
+                    setActors((data || []).map(p => p.email).filter(Boolean));
+                });
+            }, []);
+
+            React.useEffect(() => {
+                let cancelled = false;
+                (async () => {
+                    setLoading(true);
+                    try {
+                        let query = sb.from('activity_log').select('*', { count: 'exact' });
+                        if (tableFilter) query = query.eq('table_name', tableFilter);
+                        if (actionFilter) query = query.eq('action', actionFilter);
+                        if (actorFilter) query = query.eq('actor_email', actorFilter);
+                        if (dateFrom) query = query.gte('created_at', new Date(`${dateFrom}T00:00:00`).toISOString());
+                        if (dateTo) {
+                            const end = new Date(`${dateTo}T00:00:00`);
+                            end.setDate(end.getDate() + 1);
+                            query = query.lt('created_at', end.toISOString());
+                        }
+                        const term = adminSanitizeSearch(q);
+                        if (term) {
+                            query = query.or(['actor_email', 'record_id', 'parent_id', 'summary'].map(c => `${c}.ilike.%${term}%`).join(','));
+                        }
+                        const from = page * ADMIN_PAGE_SIZE;
+                        const { data, error, count } = await query
+                            .order('created_at', { ascending: false })
+                            .order('id', { ascending: false })
+                            .range(from, from + ADMIN_PAGE_SIZE - 1);
+                        if (cancelled) return;
+                        if (error) throw new Error(error.message);
+                        setRows(data || []);
+                        setTotal(count || 0);
+                    } catch (err) {
+                        if (!cancelled) notify(err.message, 'error');
+                    } finally {
+                        if (!cancelled) setLoading(false);
+                    }
+                })();
+                return () => { cancelled = true; };
+            }, [q, tableFilter, actionFilter, actorFilter, dateFrom, dateTo, page, reloadKey]);
+
+            const hasFilters = tableFilter || actionFilter || actorFilter || dateFrom || dateTo || qInput;
+            const clearAll = () => { setQInput(''); setTableFilter(''); setActionFilter(''); setActorFilter(''); setDateFrom(''); setDateTo(''); };
+
+            return (
+                <div className={adminCard}>
+                    <AdminSearchBar
+                        value={qInput}
+                        onChange={setQInput}
+                        placeholder="Search by user, invoice no., record or details..."
+                        right={<button className={adminBtnGhost} onClick={() => setReloadKey(k => k + 1)}><i className="fas fa-rotate mr-1"></i> Refresh</button>}
+                    />
+                    <div className="flex flex-wrap items-end gap-3 p-3 border-b border-slate-200 dark:border-slate-800">
+                        <div className="w-44">
+                            <AdminField label="User">
+                                <select className={adminInput} value={actorFilter} onChange={(e) => setActorFilter(e.target.value)}>
+                                    <option value="">All users</option>
+                                    {actors.map(a => <option key={a} value={a}>{a}</option>)}
+                                    <option value="(system / Supabase dashboard)">(system / Supabase dashboard)</option>
+                                </select>
+                            </AdminField>
+                        </div>
+                        <div className="w-40">
+                            <AdminField label="Action">
+                                <select className={adminInput} value={actionFilter} onChange={(e) => setActionFilter(e.target.value)}>
+                                    <option value="">All actions</option>
+                                    {Object.entries(ACTIVITY_ACTION_LABELS).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
+                                </select>
+                            </AdminField>
+                        </div>
+                        <div className="w-40">
+                            <AdminField label="Type">
+                                <select className={adminInput} value={tableFilter} onChange={(e) => setTableFilter(e.target.value)}>
+                                    <option value="">All types</option>
+                                    {Object.entries(ACTIVITY_TABLE_LABELS).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
+                                </select>
+                            </AdminField>
+                        </div>
+                        <div className="w-40">
+                            <AdminField label="From">
+                                <input type="date" className={adminInput} value={dateFrom} max={dateTo || undefined} onChange={(e) => setDateFrom(e.target.value)} />
+                            </AdminField>
+                        </div>
+                        <div className="w-40">
+                            <AdminField label="To">
+                                <input type="date" className={adminInput} value={dateTo} min={dateFrom || undefined} onChange={(e) => setDateTo(e.target.value)} />
+                            </AdminField>
+                        </div>
+                        {hasFilters && <button className={adminBtnGhost} onClick={clearAll}>Clear filters</button>}
+                    </div>
+                    <div className="overflow-x-auto">
+                        <table className="w-full">
+                            <thead className="bg-slate-50 dark:bg-slate-800/50">
+                                <tr>
+                                    <th className={adminTh}>When</th><th className={adminTh}>User</th><th className={adminTh}>Action</th>
+                                    <th className={adminTh}>What</th><th className={adminTh}>Details</th><th className={adminTh}></th>
+                                </tr>
+                            </thead>
+                            <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
+                                {rows.map(r => (
+                                    <tr key={r.id} className="hover:bg-slate-50 dark:hover:bg-slate-800/40 cursor-pointer" onClick={() => setDetail(r)}>
+                                        <td className={`${adminTd} whitespace-nowrap`}>{new Date(r.created_at).toLocaleString()}</td>
+                                        <td className={adminTd}>
+                                            <div>{r.actor_email || <span className="text-slate-400">Unknown</span>}</div>
+                                            {r.actor_role && <div className="text-[10px] uppercase tracking-wide text-slate-400">{r.actor_role === 'admin' ? 'Admin' : 'Staff'}</div>}
+                                        </td>
+                                        <td className={adminTd}>
+                                            <span className={`px-2 py-0.5 rounded-full text-[11px] font-semibold whitespace-nowrap ${ACTIVITY_ACTION_STYLE[r.action] || 'bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-300'}`}>
+                                                {ACTIVITY_ACTION_LABELS[r.action] || r.action}
+                                            </span>
+                                        </td>
+                                        <td className={`${adminTd} font-medium`}>{activityWhat(r)}</td>
+                                        <td className={`${adminTd} text-slate-500 dark:text-slate-400 max-w-xs truncate`} title={r.summary || ''}>{r.summary}</td>
+                                        <td className={`${adminTd} text-right`}><button className={adminBtnGhost}>View</button></td>
+                                    </tr>
+                                ))}
+                                {!loading && rows.length === 0 && (
+                                    <tr><td colSpan="6" className="px-3 py-10 text-center text-sm text-slate-400">No activity found.</td></tr>
+                                )}
+                            </tbody>
+                        </table>
+                        {loading && <div className="p-6 text-center text-slate-400"><i className="fas fa-circle-notch fa-spin"></i></div>}
+                    </div>
+                    <AdminPager page={page} total={total} onPage={setPage} />
+                    {detail && <ActivityDetail row={detail} onClose={() => setDetail(null)} />}
+                </div>
+            );
+        };
+
+        // ---------------------------------------------------------------
         // Admin Panel shell
         // ---------------------------------------------------------------
         const AdminPanel = ({ currentUserId, customers, onDataChanged }) => {
             const [section, setSection] = React.useState('invoices');
-            // Sections are mounted on first visit and then kept alive (hidden) so each
-            // one keeps its search text, page number and open record when you return.
-            const [mountedSections, setMountedSections] = React.useState({ invoices: true });
-            const openSection = React.useCallback((id) => {
-                setMountedSections(prev => (prev[id] ? prev : { ...prev, [id]: true }));
-                setSection(id);
-            }, []);
             const [msg, setMsg] = React.useState(null);
             const notify = React.useCallback((text, type = 'success') => setMsg({ text, type }), []);
 
@@ -5290,7 +5439,8 @@
                 { id: 'invoices', label: 'Invoices', icon: 'fa-file-invoice' },
                 { id: 'customers', label: 'Customers', icon: 'fa-users' },
                 { id: 'products', label: 'Products', icon: 'fa-boxes-stacked' },
-                { id: 'users', label: 'Users & Roles', icon: 'fa-user-shield' }
+                { id: 'users', label: 'Users & Roles', icon: 'fa-user-shield' },
+                { id: 'activity', label: 'Activity Log', icon: 'fa-clock-rotate-left' }
             ];
 
             return (
@@ -5304,7 +5454,7 @@
                         {sections.map(s => (
                             <button
                                 key={s.id}
-                                onClick={() => openSection(s.id)}
+                                onClick={() => setSection(s.id)}
                                 className={`px-3.5 h-9 rounded-lg text-xs font-semibold flex items-center gap-2 transition-colors ${
                                     section === s.id
                                         ? 'bg-gradient-to-r from-indigo-700 to-indigo-400 text-white shadow-sm'
@@ -5316,10 +5466,11 @@
                         ))}
                     </div>
 
-                    {mountedSections.invoices && <div hidden={section !== 'invoices'}><InvoicesAdmin customers={customers} notify={notify} onChanged={onDataChanged} /></div>}
-                    {mountedSections.customers && <div hidden={section !== 'customers'}><CustomersAdmin notify={notify} onChanged={onDataChanged} /></div>}
-                    {mountedSections.products && <div hidden={section !== 'products'}><ProductsAdmin notify={notify} onChanged={onDataChanged} /></div>}
-                    {mountedSections.users && <div hidden={section !== 'users'}><UsersAdmin currentUserId={currentUserId} notify={notify} /></div>}
+                    {section === 'invoices' && <InvoicesAdmin customers={customers} notify={notify} onChanged={onDataChanged} />}
+                    {section === 'customers' && <CustomersAdmin notify={notify} onChanged={onDataChanged} />}
+                    {section === 'products' && <ProductsAdmin notify={notify} onChanged={onDataChanged} />}
+                    {section === 'users' && <UsersAdmin currentUserId={currentUserId} notify={notify} />}
+                    {section === 'activity' && <ActivityLogAdmin notify={notify} />}
 
                     {msg && (
                         <div
@@ -5342,25 +5493,24 @@
             const [isLoading, setIsLoading] = React.useState(true);
             const [loadError, setLoadError] = React.useState('');
             const [activeTab, setActiveTab] = React.useState('ledger');
-            // Tabs are mounted the first time they are opened and then kept alive
-            // (just hidden) so each one remembers its expanded row, page number,
-            // search text and scroll position when the person comes back to it.
-            const [mountedTabs, setMountedTabs] = React.useState({ ledger: true });
-            const scrollByTab = React.useRef({});
-            const activeTabRef = React.useRef('ledger');
-            const changeTab = React.useCallback((nextTab) => {
-                scrollByTab.current[activeTabRef.current] = window.scrollY;
-                activeTabRef.current = nextTab;
-                setMountedTabs(prev => (prev[nextTab] ? prev : { ...prev, [nextTab]: true }));
-                setActiveTab(nextTab);
-            }, []);
-            React.useLayoutEffect(() => {
-                window.scrollTo(0, scrollByTab.current[activeTab] || 0);
+            // Keep-alive tabs: once a tab has been opened it stays mounted (just hidden) so
+            // anything typed in it (search boxes, local filters) survives switching tabs.
+            const [visitedTabs, setVisitedTabs] = React.useState({});
+            React.useEffect(() => {
+                setVisitedTabs(v => (v[activeTab] ? v : { ...v, [activeTab]: true }));
             }, [activeTab]);
+            const tabMounted = (id) => activeTab === id || !!visitedTabs[id];
+            const tabStyle = (id) => (activeTab === id ? undefined : { display: 'none' });
             const [selectedInvoice, setSelectedInvoice] = React.useState(null);
             const [returnModalInvoice, setReturnModalInvoice] = React.useState(null);
             const [isNewModalOpen, setIsNewModalOpen] = React.useState(false);
             const [toastMessage, setToastMessage] = React.useState('');
+            // Admin: invoice currently open in the Edit Invoice window (opened from the invoice view).
+            const [adminEditInvoiceId, setAdminEditInvoiceId] = React.useState(null);
+            const adminNotify = React.useCallback((text, type = 'success') => {
+                setToastMessage(type === 'error' ? `Error: ${text}` : text);
+                setTimeout(() => setToastMessage(''), type === 'error' ? 8000 : 4000);
+            }, []);
             const [theme, setTheme] = React.useState('light'); // 'light' (default / daytime) or 'dark' (night mode)
 
             // Loads the product catalog once for the item autocomplete.
@@ -5609,6 +5759,7 @@
                 search: '',
                 paymentMethod: 'ALL',
                 cwtFilter: 'ALL',
+                vatFilter: 'ALL',
                 branch: 'ALL',
                 salesRep: 'ALL',
                 returnFilter: 'ALL',
@@ -5656,6 +5807,12 @@
                         return false;
                     }
                     if (filters.cwtFilter === 'NO_2307' && inv.cwt2307Rate > 0) {
+                        return false;
+                    }
+                    if (filters.vatFilter === 'WITH_VAT' && !(inv.taxRate > 0)) {
+                        return false;
+                    }
+                    if (filters.vatFilter === 'NO_VAT' && inv.taxRate > 0) {
                         return false;
                     }
                     if (filters.returnFilter === 'WITH_RETURNS' && (!inv.returns || inv.returns.length === 0)) {
@@ -5794,10 +5951,11 @@
             };
 
             const handleResetFilters = () => {
-                setFilters({ search: '', paymentMethod: 'ALL', cwtFilter: 'ALL', branch: 'ALL', salesRep: 'ALL', returnFilter: 'ALL', dateFrom: '', dateTo: '' });
+                setFilters({ search: '', paymentMethod: 'ALL', cwtFilter: 'ALL', vatFilter: 'ALL', branch: 'ALL', salesRep: 'ALL', returnFilter: 'ALL', dateFrom: '', dateTo: '' });
             };
 
             const handleExportCSV = () => {
+                logAppEvent('EXPORT_CSV', null, `Exported ${filteredInvoices.length} invoice(s) to CSV`);
                 let csvRows = [];
                 csvRows.push(['Invoice ID', 'Date', 'Branch Location', 'Sales Rep', 'Customer Name', 'Customer TIN', 'Payment Method', 'Item Name', 'SKU', 'Unit Price (PHP)', 'Qty Purchased', 'Qty Returned', 'Discount %', 'Net Line Total (PHP)', 'BIR 2307 Rate', 'BIR 2307 Amount (PHP)', 'Net Receivable (PHP)']);
 
@@ -5844,7 +6002,7 @@
                 <div className="min-h-screen flex flex-col bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-slate-100">
                     <Header
                         activeTab={activeTab}
-                        setActiveTab={changeTab}
+                        setActiveTab={setActiveTab}
                         onOpenNewModal={() => setIsNewModalOpen(true)}
                         theme={theme}
                         onToggleTheme={toggleTheme}
@@ -5899,66 +6057,66 @@
                         />
                         )}
 
-                        {mountedTabs.ledger && (
-                            <div hidden={activeTab !== 'ledger'}>
-                                <LedgerTable
-                                    invoices={filteredInvoices}
-                                    onSelectInvoice={(inv) => setSelectedInvoice(inv)}
-                                    onOpenReturnModal={(inv) => setReturnModalInvoice(inv)}
-                                />
-                            </div>
+                        {tabMounted('ledger') && (
+                        <div style={tabStyle('ledger')}>
+                            <LedgerTable
+                                invoices={filteredInvoices}
+                                onSelectInvoice={(inv) => setSelectedInvoice(inv)}
+                                onOpenReturnModal={(inv) => setReturnModalInvoice(inv)}
+                            />
+                        </div>
                         )}
 
-                        {mountedTabs.customers && (
-                            <div hidden={activeTab !== 'customers'}>
-                                <CustomerLedgerView
-                                    invoices={filteredInvoices}
-                                    onSelectInvoice={(inv) => setSelectedInvoice(inv)}
-                                    creditNotesByEmail={creditNotesByEmail}
-                                    customersById={customersById}
-                                />
-                            </div>
+                        {tabMounted('customers') && (
+                        <div style={tabStyle('customers')}>
+                            <CustomerLedgerView
+                                invoices={filteredInvoices}
+                                onSelectInvoice={(inv) => setSelectedInvoice(inv)}
+                                creditNotesByEmail={creditNotesByEmail}
+                                customersById={customersById}
+                            />
+                        </div>
                         )}
 
-                        {mountedTabs.creditnotes && (
-                            <div hidden={activeTab !== 'creditnotes'}>
-                                <CreditNotesView
-                                    creditNotes={allCreditNotes}
-                                    invoices={enrichedInvoices}
-                                    onSelectInvoice={(inv) => setSelectedInvoice(inv)}
-                                />
-                            </div>
+                        {tabMounted('creditnotes') && (
+                        <div style={tabStyle('creditnotes')}>
+                            <CreditNotesView
+                                creditNotes={allCreditNotes}
+                                invoices={enrichedInvoices}
+                                onSelectInvoice={(inv) => setSelectedInvoice(inv)}
+                            />
+                        </div>
                         )}
 
-                        {mountedTabs.salesreps && (
-                            <div hidden={activeTab !== 'salesreps'}>
-                                <SalesRepReportView
-                                    invoices={filteredInvoices}
-                                    onSelectInvoice={(inv) => setSelectedInvoice(inv)}
-                                    onPickRep={(rep) => setFilters({ ...filters, salesRep: rep })}
-                                />
-                            </div>
+                        {tabMounted('salesreps') && (
+                        <div style={tabStyle('salesreps')}>
+                            <SalesRepReportView
+                                invoices={filteredInvoices}
+                                onSelectInvoice={(inv) => setSelectedInvoice(inv)}
+                                onPickRep={(rep) => setFilters({ ...filters, salesRep: rep })}
+                            />
+                        </div>
                         )}
 
-                        {mountedTabs.admin && profile?.role === 'admin' && (
-                            <div hidden={activeTab !== 'admin'}>
-                                <AdminPanel
-                                    currentUserId={user?.id}
-                                    customers={dbCustomers}
-                                    onDataChanged={refreshAllData}
-                                />
-                            </div>
+                        {tabMounted('admin') && profile?.role === 'admin' && (
+                        <div style={tabStyle('admin')}>
+                            <AdminPanel
+                                currentUserId={user?.id}
+                                customers={dbCustomers}
+                                onDataChanged={refreshAllData}
+                            />
+                        </div>
                         )}
 
-                        {mountedTabs.products && (
-                            <div hidden={activeTab !== 'products'}>
-                                <ProductAnalyticsView
-                                    invoices={filteredInvoices}
-                                    products={products}
-                                    isAdmin={profile?.role === 'admin'}
-                                    onSrpSaved={() => fetchProductsFromSupabase().then(setProducts).catch(err => console.error(err))}
-                                />
-                            </div>
+                        {tabMounted('products') && (
+                        <div style={tabStyle('products')}>
+                            <ProductAnalyticsView
+                                invoices={filteredInvoices}
+                                products={products}
+                                isAdmin={profile?.role === 'admin'}
+                                onSrpSaved={() => fetchProductsFromSupabase().then(setProducts).catch(err => console.error(err))}
+                            />
+                        </div>
                         )}
                         </React.Fragment>
                         )}
@@ -5977,7 +6135,22 @@
                         onUpdateSalesRep={handleUpdateSalesRep}
                         isAdmin={profile?.role === 'admin'}
                         onUpdateCwt2307={handleUpdateCwt2307}
+                        onEditInvoice={(id) => {
+                            setSelectedInvoice(null);
+                            setAdminEditInvoiceId(id);
+                        }}
                     />
+
+                    {adminEditInvoiceId && profile?.role === 'admin' && (
+                        <InvoiceEditor
+                            invoiceId={adminEditInvoiceId}
+                            customers={dbCustomers}
+                            notify={adminNotify}
+                            onClose={() => setAdminEditInvoiceId(null)}
+                            onRenamed={(newId) => setAdminEditInvoiceId(newId)}
+                            onChanged={refreshAllData}
+                        />
+                    )}
 
                     <ProcessReturnModal
                         isOpen={!!returnModalInvoice}
@@ -6012,6 +6185,16 @@
 
         // Wraps the whole app: shows the Login screen until there's a Supabase
         // session, then loads that user's profile (role) and renders App.
+        // Records non-row events (sign-in, CSV export, print) in the admin Activity Log.
+        // Fire-and-forget: a logging failure must never get in the user's way.
+        const logAppEvent = (action, record, summary) => {
+            try {
+                Promise.resolve(sb.rpc('log_event', { p_action: action, p_record: record || null, p_summary: summary || null }))
+                    .then((res) => { if (res && res.error) console.warn('Activity log:', res.error.message); })
+                    .catch(() => {});
+            } catch (_) { /* ignore */ }
+        };
+
         const AuthGate = () => {
             const [session, setSession] = React.useState(undefined); // undefined = still checking, null = signed out
             const [profile, setProfile] = React.useState(null);
@@ -6029,11 +6212,21 @@
                 if (session === undefined) return;
                 if (session === null) { setProfile(null); return; }
                 fetchProfile(session.user.id)
-                    .then(setProfile)
+                    .then((p) => {
+                        setProfile(p);
+                        try {
+                            const key = `lfLoginLogged:${session.user.id}`;
+                            if (!sessionStorage.getItem(key)) {
+                                sessionStorage.setItem(key, '1');
+                                logAppEvent('LOGIN', null, 'Signed in');
+                            }
+                        } catch (_) { /* ignore */ }
+                    })
                     .catch(err => setProfileError(err.message || 'Could not load your profile.'));
             }, [session]);
 
             const handleLogout = async () => {
+                try { sessionStorage.removeItem(`lfLoginLogged:${session.user.id}`); } catch (_) { /* ignore */ }
                 await sb.auth.signOut();
                 setSession(null);
                 setProfile(null);
